@@ -108,6 +108,7 @@ public:
 	VTK_QUADRATIC_HEXAHEDRON=25
     };
     static void setVTKType();
+    static int getVTKType(int classTag);  // 0 if the class has no VTK cell type
 
 private:
     static std::map<int,VtkType> vtktypes;

@@ -26,6 +26,7 @@ target_sources(OPS_Recorder
       PVDRecorder.cpp      
       Recorder.cpp
       RemoveRecorder.cpp
+      TecplotRecorder.cpp
       VTK_Recorder.cpp
     PUBLIC
       DamageRecorder.h
@@ -47,6 +48,7 @@ target_sources(OPS_Recorder
       PVDRecorder.h      
       Recorder.h
       RemoveRecorder.h
+      TecplotRecorder.h
       VTK_Recorder.h
 )
 

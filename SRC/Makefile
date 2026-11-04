@@ -433,7 +433,8 @@ RECORDER_LIBS = $(FE)/recorder/Recorder.o \
 	$(FE)/recorder/NodeRecorderRMS.o \
 	$(FE)/recorder/MPCORecorder.o \
 	$(FE)/recorder/VTK_Recorder.o \
-	$(FE)/recorder/VTKHDF_Recorder.o
+	$(FE)/recorder/VTKHDF_Recorder.o \
+	$(FE)/recorder/TecplotRecorder.o
 
 
 DATABASE_LIBS = $(FE)/database/FileDatastore.o \

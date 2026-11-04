@@ -82,6 +82,7 @@ void* OPS_EnvelopeNodeRecorder();
 void* OPS_ElementRecorder();
 void* OPS_EnvelopeElementRecorder();
 void* OPS_PVDRecorder();
+void* OPS_TecplotRecorder();
 void* OPS_AlgorithmRecorder();
 void* OPS_RemoveRecorder();
 #ifdef _HDF5
@@ -119,6 +120,8 @@ namespace {
         recordersMap.insert(std::make_pair("EnvelopeElement", &OPS_EnvelopeElementRecorder));
 	recordersMap.insert(std::make_pair("PVD", &OPS_PVDRecorder));
 	recordersMap.insert(std::make_pair("BgPVD", &OPS_PVDRecorder));
+	recordersMap.insert(std::make_pair("tecplot", &OPS_TecplotRecorder));
+	recordersMap.insert(std::make_pair("BgTecplot", &OPS_TecplotRecorder));
 	recordersMap.insert(std::make_pair("Remove", &OPS_RemoveRecorder));
 	recordersMap.insert(std::make_pair("ElementRemoval", &OPS_RemoveRecorder));
 	recordersMap.insert(std::make_pair("NodeRemoval", &OPS_RemoveRecorder));
@@ -163,7 +166,7 @@ int OPS_Recorder()
         return -1;
     }
 
-    if (strcmp(type,"BgPVD") == 0) {
+    if (strcmp(type,"BgPVD") == 0 || strcmp(type,"BgTecplot") == 0) {
 	BackgroundMesh& bg = OPS_getBgMesh();
 	bg.addRecorder(theRecorder);
     } else {

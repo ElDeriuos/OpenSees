@@ -2007,6 +2007,14 @@ PVDRecorder::setVTKType()
     vtktypes[ELE_TAG_FSIFluidBoundaryElement2D] = VTK_LINE;
 }
 
+int
+PVDRecorder::getVTKType(int classTag)
+{
+    setVTKType();
+    std::map<int,VtkType>::iterator it = vtktypes.find(classTag);
+    return it == vtktypes.end() ? 0 : it->second;
+}
+
 void
 PVDRecorder::getfilename(const char* name)
 {

@@ -62,6 +62,7 @@
  #include <VTK_Recorder.h>
 
 extern void* OPS_PVDRecorder();
+extern void* OPS_TecplotRecorder();
 
 extern void* OPS_GmshRecorder();
 #ifdef _HDF5
@@ -1916,6 +1917,11 @@ enum outputMode  {STANDARD_STREAM, DATA_STREAM, XML_STREAM, DATABASE_STREAM, BIN
      else if (strcmp(argv[1],"pvd") == 0 || strcmp(argv[1],"PVD") == 0) {
        OPS_ResetInputNoBuilder(clientData, interp, 2, argc, argv, &theDomain);
        (*theRecorder) = (Recorder*) OPS_PVDRecorder();
+     }
+
+     else if (strcmp(argv[1],"tecplot") == 0 || strcmp(argv[1],"Tecplot") == 0) {
+       OPS_ResetInputNoBuilder(clientData, interp, 2, argc, argv, &theDomain);
+       (*theRecorder) = (Recorder*) OPS_TecplotRecorder();
      }
 
      else if (strcmp(argv[1],"vtk") == 0 || strcmp(argv[1],"VTK") == 0) {
