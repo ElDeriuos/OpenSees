@@ -271,14 +271,24 @@ jobs:
             codesign --force --sign - "$lib"
           done
 
-          cat > "$PKGDIR/opensees" <<'EOF'
+          # The launcher must NOT be named 'opensees': APFS is case-insensitive,
+          # so 'opensees' would clobber the binary 'OpenSees' and the launcher
+          # would then exec itself forever. '.command' is also Finder-double-clickable.
+          cat > "$PKGDIR/opensees.command" <<'EOF'
           #!/bin/sh
           # OpenSees launcher: makes sure the bundled Tcl library is found.
           DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
           export TCL_LIBRARY="$DIR/lib/tcl8.6"
           exec "$DIR/OpenSees" "$@"
           EOF
-          chmod +x "$PKGDIR/opensees"
+          chmod +x "$PKGDIR/opensees.command"
+
+          # fail fast if the binary got clobbered by anything
+          file "$PKGDIR/OpenSees" | grep -q "Mach-O" || {
+            echo "packaged OpenSees is not the Mach-O binary:" >&2
+            file "$PKGDIR/OpenSees" >&2
+            exit 1
+          }
 
           cat > "$PKGDIR/README.txt" <<EOF
           OpenSees ${GITHUB_REF_NAME}
@@ -286,8 +296,9 @@ jobs:
           and a VTK recorder buffer-overflow fix.
 
           Run from this directory:
-            ./opensees your_script.tcl     (recommended; sets TCL_LIBRARY for you)
-            ./OpenSees your_script.tcl     (works as long as lib/ stays next to it)
+            ./opensees.command your_script.tcl   (recommended; sets TCL_LIBRARY for you)
+            open opensees.command               (double-click also works)
+            ./OpenSees your_script.tcl          (needs TCL_LIBRARY=lib/tcl8.6 set)
 
           New in this fork:
             recorder tecplot out.plt disp vel accel incrDisp reaction unbalancedLoad mass
@@ -352,18 +363,21 @@ jobs:
           }
 
           FAIL=""
-          # Probe A: build-tree exe (untouched by packaging), normal environment
-          rc=0; run_bg 90 a.log build/Release/OpenSees smoke.tcl || rc=$?
+          TCLREF="$PWD/pkg/$PKG/lib/tcl8.6"
+
+          # Probe A: build-tree exe (untouched by packaging), normal
+          # environment plus the packaged Tcl library
+          rc=0; run_bg 90 a.log env TCL_LIBRARY="$TCLREF" build/Release/OpenSees smoke.tcl || rc=$?
           echo "PROBE A build-tree/plain-env exit=$rc"; cat a.log
           [ $rc -eq 0 ] && grep -q SMOKE_OK a.log || FAIL="A"
 
           # Probe B: build-tree exe, stripped environment
-          rc=0; run_bg 90 b.log env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" build/Release/OpenSees smoke.tcl || rc=$?
+          rc=0; run_bg 90 b.log env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" TCL_LIBRARY="$TCLREF" build/Release/OpenSees smoke.tcl || rc=$?
           echo "PROBE B build-tree/env-i exit=$rc"; cat b.log
           [ $rc -eq 0 ] && grep -q SMOKE_OK b.log || FAIL="$FAIL B"
 
           # Probe C: packaged exe via the launcher (what users run)
-          rc=0; run_bg 120 c.log env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl || rc=$?
+          rc=0; run_bg 120 c.log env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees.command smoke.tcl || rc=$?
           echo "PROBE C packaged/launcher exit=$rc"; cat c.log
           [ $rc -eq 0 ] && grep -q SMOKE_OK c.log || FAIL="$FAIL C"
 
@@ -648,7 +662,8 @@ jobs:
           All required runtime libraries are inside the archives — **no development tools needed**.
 
           - **Windows**: unzip anywhere, then run `OpenSees.bat your_script.tcl` (the DLLs and `lib\tcl8.6` must stay next to `OpenSees.exe`).
-          - **macOS / Linux**: extract, then run `./opensees your_script.tcl` from that directory (or `./OpenSees` directly).
+          - **macOS**: extract, then run `./opensees.command your_script.tcl` (or double-click `opensees.command` in Finder).
+          - **Linux**: extract, then run `./opensees your_script.tcl` from that directory (or `./OpenSees` directly).
 
           Built with the same toolchains as upstream CI: MSVC 2022 + Intel oneAPI (MKL, MUMPS, ifx), GCC 11 + conan, AppleClang + GCC; Tcl 8.6.11, HDF5 1.14.6. Each packaged binary passed the OpenSees test suite and a from-scratch smoke analysis in a stripped environment.
           EOF
