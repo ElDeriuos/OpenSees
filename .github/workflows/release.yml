@@ -297,7 +297,7 @@ jobs:
 
       - name: Smoke test the packaged binary
         run: |
-          set -euxo pipefail
+          set -uxo pipefail
           PKG="OpenSees_${GITHUB_REF_NAME}_macOS_arm64"
           cat > smoke.tcl <<'EOF'
           puts "SMOKE_START"
@@ -324,21 +324,54 @@ jobs:
           puts "SMOKE_OK"
           exit 0
           EOF
-          # guard against any hang: hard timeout (GNU timeout, or perl alarm on macOS)
-          run_to() {
-            if command -v timeout >/dev/null 2>&1; then timeout -k 10 "$1" "${@:2}"
-            else perl -e 'alarm shift; exec @ARGV' "$1" "${@:2}"
-            fi
+
+          # Facts first: architecture and signature of both binaries
+          file build/Release/OpenSees "./pkg/$PKG/OpenSees" || true
+          codesign -dv --verbose=2 "./pkg/$PKG/OpenSees" 2>&1 | head -12 || true
+
+          # run_bg <secs> <logfile> <cmd...> : run with a guaranteed SIGKILL
+          # watchdog (GNU timeout does not exist on macOS and the perl alarm
+          # trick proved unable to kill this hang). If the process is still
+          # alive after <secs>, sample its stack, print it, then kill -9.
+          run_bg() {
+            secs="$1"; log="$2"; shift 2
+            "$@" > "$log" 2>&1 < /dev/null &
+            pid=$!
+            ( sleep "$secs"
+              if kill -0 $pid 2>/dev/null; then
+                echo "::warning::still alive after ${secs}s - sampling stack, then SIGKILL"
+                sample $pid 10 -file sample.txt >/dev/null 2>&1 || true
+                head -80 sample.txt 2>/dev/null || true
+                kill -9 $pid 2>/dev/null
+              fi ) &
+            wdpid=$!
+            wait $pid; rc=$?
+            kill $wdpid 2>/dev/null || true
+            wait $wdpid 2>/dev/null || true
+            return $rc
           }
-          # stdin from /dev/null: g3TclMain reads stdin after the script,
-          # and an open pipe with no EOF there would block forever.
-          # 2>&1: OpenSees redefines puts to write to stderr, so without it
-          # smoke.log would be empty.
-          run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null 2>&1 | tee smoke.log
-          grep -q SMOKE_OK smoke.log
+
+          FAIL=""
+          # Probe A: build-tree exe (untouched by packaging), normal environment
+          rc=0; run_bg 90 a.log build/Release/OpenSees smoke.tcl || rc=$?
+          echo "PROBE A build-tree/plain-env exit=$rc"; cat a.log
+          [ $rc -eq 0 ] && grep -q SMOKE_OK a.log || FAIL="A"
+
+          # Probe B: build-tree exe, stripped environment
+          rc=0; run_bg 90 b.log env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" build/Release/OpenSees smoke.tcl || rc=$?
+          echo "PROBE B build-tree/env-i exit=$rc"; cat b.log
+          [ $rc -eq 0 ] && grep -q SMOKE_OK b.log || FAIL="$FAIL B"
+
+          # Probe C: packaged exe via the launcher (what users run)
+          rc=0; run_bg 120 c.log env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl || rc=$?
+          echo "PROBE C packaged/launcher exit=$rc"; cat c.log
+          [ $rc -eq 0 ] && grep -q SMOKE_OK c.log || FAIL="$FAIL C"
+
+          if [ -n "$FAIL" ]; then
+            echo "::error::failing probes:$FAIL"
+            exit 1
+          fi
           grep -q Displacement smoke.plt
-          run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/OpenSees smoke.tcl < /dev/null \
-            || echo "::warning::bare ./OpenSees needs TCL_LIBRARY; start via ./opensees"
 
       - name: Create tarball
         run: |
