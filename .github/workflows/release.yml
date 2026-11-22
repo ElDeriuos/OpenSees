@@ -140,7 +140,9 @@ jobs:
           # the launcher must work in a bare environment (no build tools).
           # stdin from /dev/null: g3TclMain reads stdin after the script,
           # and an open pipe with no EOF there would block forever.
-          run_to 120 env -i PATH=/usr/bin:/bin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null | tee smoke.log
+          # 2>&1: OpenSees redefines puts to write to stderr, so without it
+          # smoke.log would be empty.
+          run_to 120 env -i PATH=/usr/bin:/bin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null 2>&1 | tee smoke.log
           grep -q SMOKE_OK smoke.log
           grep -q Displacement smoke.plt
           # the bare exe is informational only
@@ -330,7 +332,9 @@ jobs:
           }
           # stdin from /dev/null: g3TclMain reads stdin after the script,
           # and an open pipe with no EOF there would block forever.
-          run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null | tee smoke.log
+          # 2>&1: OpenSees redefines puts to write to stderr, so without it
+          # smoke.log would be empty.
+          run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null 2>&1 | tee smoke.log
           grep -q SMOKE_OK smoke.log
           grep -q Displacement smoke.plt
           run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/OpenSees smoke.tcl < /dev/null \
