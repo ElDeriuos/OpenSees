@@ -1,0 +1,595 @@
+name: Release Binaries
+
+# Builds self-contained OpenSees (Tcl) binaries for Windows, macOS and Linux
+# from the tagged commit, runs the test suite, bundles every runtime library
+# the binary needs (Windows DLLs, macOS dylibs, Linux .so) plus the Tcl
+# script library (init.tcl), smoke-tests the packaged binary in a clean
+# environment, and publishes the three archives as a GitHub release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ubuntu:
+    name: Ubuntu 22.04 (x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install conan and packaging tools
+        run: |
+          pip install conan
+          conan profile detect --force
+          sudo apt-get update -q
+          sudo apt-get install -y -q gfortran patchelf
+
+      - name: Configure
+        run: |
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          conan install . --build=missing
+          cmake -S . -B build/Release \
+            -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build OpenSees and OpenSeesPy
+        run: |
+          cmake --build build/Release --target OpenSees -j"$(nproc)"
+          cmake --build build/Release --target OpenSeesPy -j"$(nproc)"
+
+      - name: Run test suite
+        run: |
+          pip install pytest
+          cp build/Release/OpenSeesPy.so tests/opensees.so
+          cd tests
+          pytest -v
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          PKG="OpenSees_${GITHUB_REF_NAME}_Ubuntu22.04_x86_64"
+          PKGDIR="pkg/$PKG"
+          mkdir -p "$PKGDIR/lib"
+          cp build/Release/OpenSees "$PKGDIR/"
+
+          # Tcl script library (init.tcl and friends) from the conan package
+          TCLDIR="$(dirname "$(find "$HOME/.conan2" -name init.tcl -path '*tcl8.6*' | head -n1)")"
+          cp -a "$TCLDIR" "$PKGDIR/lib/tcl8.6"
+
+          # Bundle every non-system shared library the binary needs
+          for lib in $(ldd build/Release/OpenSees | awk '/=> \// {print $3}' | sort -u); do
+            case "$(basename "$lib")" in
+              ld-linux*|libc.so*|libm.so*|libgcc_s*|libstdc++*|libpthread*|libdl.so*|librt.so*)
+                ;; # part of every base Linux install, do not bundle
+              *) cp -L "$lib" "$PKGDIR/lib/" ;;
+            esac
+          done
+          patchelf --set-rpath '$ORIGIN/lib' "$PKGDIR/OpenSees"
+
+          cat > "$PKGDIR/opensees" <<'EOF'
+          #!/bin/sh
+          # OpenSees launcher: makes sure the bundled Tcl library is found.
+          DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          export TCL_LIBRARY="$DIR/lib/tcl8.6"
+          exec "$DIR/OpenSees" "$@"
+          EOF
+          chmod +x "$PKGDIR/opensees"
+
+          cat > "$PKGDIR/README.txt" <<EOF
+          OpenSees ${GITHUB_REF_NAME}
+          Fork of OpenSees/OpenSees (upstream >= v3.8.0) with a Tecplot recorder
+          and a VTK recorder buffer-overflow fix.
+
+          Run from this directory:
+            ./opensees your_script.tcl     (recommended; sets TCL_LIBRARY for you)
+            ./OpenSees your_script.tcl     (works as long as lib/ stays next to it)
+
+          New in this fork:
+            recorder tecplot out.plt disp vel accel incrDisp reaction unbalancedLoad mass
+            recorder tecplot out.plt eigen 1 eleResponse "axialForce"
+            options: -precision n, -dT dt, -rTolDt tol, -region tag, -legacy (Tecplot 8/9)
+          EOF
+
+      - name: Smoke test the packaged binary
+        run: |
+          set -euxo pipefail
+          PKG="OpenSees_${GITHUB_REF_NAME}_Ubuntu22.04_x86_64"
+          cat > smoke.tcl <<'EOF'
+          puts "SMOKE_START"
+          wipe
+          model basic -ndm 2
+          node 1 0 0
+          node 2 1 0
+          fix 1 1 1
+          uniaxialMaterial Elastic 1 1000.0
+          element truss 1 1 2 1.0 1
+          timeSeries Linear 1
+          pattern Plain 1 Linear {
+              load 2 1.0 0.0
+          }
+          system BandGeneral
+          numberer Plain
+          constraints Plain
+          integrator LoadControl 1.0
+          algorithm Linear
+          analysis Static
+          recorder tecplot smoke.plt disp
+          analyze 1
+          puts "SMOKE_OK"
+          EOF
+          # the launcher must work in a bare environment (no build tools)
+          env -i PATH=/usr/bin:/bin HOME="$PWD" "./pkg/$PKG/opensees" smoke.tcl | tee smoke.log
+          grep -q SMOKE_OK smoke.log
+          grep -q Displacement smoke.plt
+          # the bare exe is informational only
+          env -i PATH=/usr/bin:/bin HOME="$PWD" "./pkg/$PKG/OpenSees" smoke.tcl \
+            || echo "::warning::bare ./OpenSees needs TCL_LIBRARY; start via ./opensees"
+
+      - name: Create tarball
+        run: |
+          PKG="OpenSees_${GITHUB_REF_NAME}_Ubuntu22.04_x86_64"
+          rm -f smoke.log smoke.plt
+          tar -czf "pkg/$PKG.tar.gz" -C pkg "$PKG"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-package
+          path: pkg/*.tar.gz
+
+  build-macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install conan, locate gfortran
+        run: |
+          pip install conan
+          conan profile detect --force
+          brew list --formula gcc >/dev/null 2>&1 || brew install gcc
+          FC=""
+          for cand in gfortran-15 gfortran-14 gfortran-13 gfortran; do
+            if command -v "$cand" >/dev/null 2>&1; then FC="$(command -v "$cand")"; break; fi
+          done
+          if [ -z "$FC" ]; then echo "no gfortran found" >&2; exit 1; fi
+          echo "FC=$FC" >> "$GITHUB_ENV"
+          "$FC" --version | head -n1
+
+      - name: Configure
+        run: |
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          export FC="$FC"
+          GFORTRAN_LIBDIR="$(dirname "$("$FC" -print-file-name=libgfortran.dylib)")"
+          export LDFLAGS="-L${GFORTRAN_LIBDIR} -lgfortran"
+          conan install . --build=missing
+          cmake -S . -B build/Release \
+            -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build OpenSees and OpenSeesPy
+        run: |
+          cmake --build build/Release --target OpenSees -j"$(sysctl -n hw.ncpu)"
+          cmake --build build/Release --target OpenSeesPy -j"$(sysctl -n hw.ncpu)"
+          mv build/Release/OpenSeesPy.dylib build/Release/opensees.so
+
+      - name: Sanity and recorder tests
+        run: |
+          export PYTHONPATH="./build/Release"
+          python3 ./EXAMPLES/ExamplePython/example_variable_analysis.py
+          pip install pytest
+          cp build/Release/opensees.so tests/opensees.so
+          cd tests
+          python3 -m pytest -v test_tecplot_recorder.py
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          PKG="OpenSees_${GITHUB_REF_NAME}_macOS_arm64"
+          PKGDIR="pkg/$PKG"
+          mkdir -p "$PKGDIR/lib"
+          cp build/Release/OpenSees "$PKGDIR/"
+
+          TCLDIR="$(dirname "$(find "$HOME/.conan2" -name init.tcl -path '*tcl8.6*' | head -n1)")"
+          cp -a "$TCLDIR" "$PKGDIR/lib/tcl8.6"
+
+          # Recursively collect the non-system dylibs the binary links
+          # (conan cache, build tree, homebrew) and point everything at lib/.
+          # Bash 3.2 compatible: recursion instead of arrays.
+          EXE="$PKGDIR/OpenSees"
+          seen=""
+
+          process() {
+            local f="$1" dep base src
+            while IFS= read -r dep; do
+              [ -z "$dep" ] && continue
+              base="${dep##*/}"
+              case "$dep" in
+                /usr/lib/*|/System/Library/*) continue ;;
+              esac
+              case "$seen" in
+                *"|$base|"*)
+                  install_name_tool -change "$dep" "@rpath/$base" "$f"
+                  continue
+                  ;;
+              esac
+              case "$dep" in
+                /*) src="$dep" ;;
+                *)  src="$(find build/Release "$HOME/.conan2/p" /opt/homebrew -name "$base" 2>/dev/null | head -n1)" ;;
+              esac
+              if [ -z "$src" ]; then
+                echo "::warning::cannot resolve $dep (needed by $f)"
+                continue
+              fi
+              cp -L "$src" "$PKGDIR/lib/$base"
+              seen="$seen|$base|"
+              process "$PKGDIR/lib/$base"
+              install_name_tool -change "$dep" "@rpath/$base" "$f"
+            done < <(otool -L "$f" | tail -n +2 | awk '{print $1}')
+          }
+
+          process "$EXE"
+          install_name_tool -add_rpath "@executable_path/lib" "$EXE" || true
+
+          # install_name_tool invalidates the (ad-hoc) signature, and arm64
+          # macOS refuses to run binaries with a broken signature: re-sign.
+          codesign --force --sign - "$EXE"
+          for lib in "$PKGDIR/lib"/*.dylib "$PKGDIR/lib"/*.so*; do
+            [ -e "$lib" ] || continue
+            codesign --force --sign - "$lib"
+          done
+
+          cat > "$PKGDIR/opensees" <<'EOF'
+          #!/bin/sh
+          # OpenSees launcher: makes sure the bundled Tcl library is found.
+          DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          export TCL_LIBRARY="$DIR/lib/tcl8.6"
+          exec "$DIR/OpenSees" "$@"
+          EOF
+          chmod +x "$PKGDIR/opensees"
+
+          cat > "$PKGDIR/README.txt" <<EOF
+          OpenSees ${GITHUB_REF_NAME}
+          Fork of OpenSees/OpenSees (upstream >= v3.8.0) with a Tecplot recorder
+          and a VTK recorder buffer-overflow fix.
+
+          Run from this directory:
+            ./opensees your_script.tcl     (recommended; sets TCL_LIBRARY for you)
+            ./OpenSees your_script.tcl     (works as long as lib/ stays next to it)
+
+          New in this fork:
+            recorder tecplot out.plt disp vel accel incrDisp reaction unbalancedLoad mass
+            recorder tecplot out.plt eigen 1 eleResponse "axialForce"
+            options: -precision n, -dT dt, -rTolDt tol, -region tag, -legacy (Tecplot 8/9)
+          EOF
+
+      - name: Smoke test the packaged binary
+        run: |
+          set -euxo pipefail
+          PKG="OpenSees_${GITHUB_REF_NAME}_macOS_arm64"
+          cat > smoke.tcl <<'EOF'
+          puts "SMOKE_START"
+          wipe
+          model basic -ndm 2
+          node 1 0 0
+          node 2 1 0
+          fix 1 1 1
+          uniaxialMaterial Elastic 1 1000.0
+          element truss 1 1 2 1.0 1
+          timeSeries Linear 1
+          pattern Plain 1 Linear {
+              load 2 1.0 0.0
+          }
+          system BandGeneral
+          numberer Plain
+          constraints Plain
+          integrator LoadControl 1.0
+          algorithm Linear
+          analysis Static
+          recorder tecplot smoke.plt disp
+          analyze 1
+          puts "SMOKE_OK"
+          EOF
+          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" "./pkg/$PKG/opensees" smoke.tcl | tee smoke.log
+          grep -q SMOKE_OK smoke.log
+          grep -q Displacement smoke.plt
+          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" "./pkg/$PKG/OpenSees" smoke.tcl \
+            || echo "::warning::bare ./OpenSees needs TCL_LIBRARY; start via ./opensees"
+
+      - name: Create tarball
+        run: |
+          PKG="OpenSees_${GITHUB_REF_NAME}_macOS_arm64"
+          rm -f smoke.log smoke.plt
+          tar -czf "pkg/$PKG.tar.gz" -C pkg "$PKG"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-package
+          path: pkg/*.tar.gz
+
+  build-windows:
+    name: Windows (x64)
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Microsoft Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: 2022
+
+      - name: Intel oneAPI Basic & HPC Toolkits
+        shell: pwsh
+        env:
+          WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/7dff44ba-e3af-4448-841c-0d616c8da6e7/w_BaseKit_p_2024.1.0.595_offline.exe
+          WINDOWS_BASEKIT_COMPONENTS: intel.oneapi.win.mkl.devel
+          WINDOWS_HPCKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/c95a3b26-fc45-496c-833b-df08b10297b9/w_HPCKit_p_2024.1.0.561_offline.exe
+          WINDOWS_HPCKIT_COMPONENTS: "intel.oneapi.win.mpi.devel:intel.oneapi.win.ifort-compiler"
+        working-directory: ${{ github.workspace }}\.github\workflows
+        run: |
+          ./install_fortran.bat $env:WINDOWS_BASEKIT_URL $env:WINDOWS_BASEKIT_COMPONENTS
+          ./install_fortran.bat $env:WINDOWS_HPCKIT_URL $env:WINDOWS_HPCKIT_COMPONENTS
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install conan
+        run: |
+          pip install conan
+          conan profile detect --force
+
+      - name: Build MUMPS
+        shell: cmd
+        run: |
+          git clone https://github.com/OpenSees/mumps.git
+          cd mumps
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 mod
+          cmake -S . -B build -G Ninja -Darith=d -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" -DCMAKE_EXE_LINKER_FLAGS="/link /FORCE:MULTIPLE"  -DCMAKE_SHARED_LINKER_FLAGS="/link /FORCE:MULTIPLE"
+          cd build
+          cmake --build . --config Release
+
+      - name: Configure
+        shell: cmd
+        run: |
+          set CMAKE_POLICY_VERSION_MINIMUM=3.5
+          conan install . -s arch=x86_64 -s compiler.runtime=static --build=missing -c tools.cmake.cmaketoolchain:generator=Ninja
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 mod
+          cmake.exe -S . -B build/Release -G "Ninja"  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" -DCMAKE_Fortran_COMPILER="ifx" -DBLA_STATIC=ON  -DMKL_LINK=static -DMKL_INTERFACE_FULL=intel_lp64  -DMUMPS_DIR="..\..\mumps\build" -DCMAKE_EXE_LINKER_FLAGS="/FORCE:MULTIPLE" -DCMAKE_SHARED_LINKER_FLAGS="/FORCE:MULTIPLE" -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON
+
+      - name: Build OpenSees and OpenSeesPy
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 mod
+          cd build\Release
+          cmake --build . --config Release --target OpenSees -j 8
+          cmake --build . --config Release --target OpenSeesPy -j 8
+
+      - name: Sanity and recorder tests
+        shell: pwsh
+        run: |
+          Copy-Item build/Release/OpenSeesPy.dll build/Release/opensees.pyd
+          Copy-Item "C:\Program Files (x86)\Intel\oneAPI\compiler\2024.1\bin\libiomp5md.dll" build/Release/
+          $env:PYTHONPATH = "$PWD/build/Release"
+          python ./EXAMPLES/ExamplePython/example_variable_analysis.py
+          pip install pytest
+          Copy-Item build/Release/opensees.pyd tests/
+          Copy-Item build/Release/libiomp5md.dll tests/
+          Push-Location tests
+          python -m pytest -v test_tecplot_recorder.py
+          Pop-Location
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $pkgName = "OpenSees_${tag}_Windows_x64"
+          $pkg = "pkg/$pkgName"
+          New-Item -ItemType Directory -Force -Path "$pkg/lib" | Out-Null
+          Copy-Item build/Release/OpenSees.exe $pkg
+
+          # Tcl script library (init.tcl and friends) from the conan package
+          $tclInit = Get-ChildItem "$env:USERPROFILE/.conan2/p" -Recurse -Filter init.tcl -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'tcl8\.6' } | Select-Object -First 1
+          if ($tclInit) {
+            Copy-Item -Recurse $tclInit.Directory.FullName "$pkg/lib/tcl8.6"
+          } else {
+            Write-Warning "init.tcl not found in the conan cache"
+          }
+
+          # Index every DLL available from the build tree, the conan cache and
+          # the Intel oneAPI installation, then walk OpenSees.exe's dependency
+          # tree and bundle everything that is not an OS DLL.
+          $dllMap = @{}
+          foreach ($root in @("build/Release", "$env:USERPROFILE/.conan2/p", "C:/Program Files (x86)/Intel/oneAPI")) {
+            Get-ChildItem $root -Recurse -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object {
+              if (-not $dllMap.ContainsKey($_.Name)) { $dllMap[$_.Name] = $_.FullName }
+            }
+          }
+          Write-Host "indexed $($dllMap.Count) candidate DLLs"
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          $queue.Enqueue((Resolve-Path "$pkg/OpenSees.exe").Path)
+          $seen = @{}
+          while ($queue.Count -gt 0) {
+            $f = $queue.Dequeue()
+            $names = & dumpbin /dependents $f | ForEach-Object {
+              if ($_ -match '^\s+(\S+\.dll)\s*$') { $Matches[1] }
+            }
+            foreach ($name in $names) {
+              if ($seen.ContainsKey($name)) { continue }
+              $seen[$name] = $true
+              if (Test-Path "C:/Windows/System32/$name") { continue }  # provided by Windows
+              if ($dllMap.ContainsKey($name)) {
+                Copy-Item $dllMap[$name] $pkg
+                $queue.Enqueue((Resolve-Path "$pkg/$name").Path)
+                Write-Host "bundled $name"
+              } else {
+                Write-Warning "dependency not found anywhere: $name (needed by $f)"
+              }
+            }
+          }
+
+          # Launcher: sets TCL_LIBRARY so no Tcl installation is needed
+          @'
+          @echo off
+          setlocal
+          set "DIR=%~dp0"
+          set "TCL_LIBRARY=%DIR%lib\tcl8.6"
+          "%DIR%OpenSees.exe" %*
+          endlocal
+          '@ | Set-Content "$pkg/OpenSees.bat" -Encoding ASCII
+
+          @"
+          OpenSees $tag
+          Fork of OpenSees/OpenSees (upstream >= v3.8.0) with a Tecplot recorder
+          and a VTK recorder buffer-overflow fix.
+
+          Run from this directory:
+            OpenSees.bat your_script.tcl    (recommended; sets TCL_LIBRARY for you)
+            OpenSees.exe your_script.tcl    (keep the DLLs and lib\ next to it)
+
+          New in this fork:
+            recorder tecplot out.plt disp vel accel incrDisp reaction unbalancedLoad mass
+            recorder tecplot out.plt eigen 1 eleResponse "axialForce"
+            options: -precision n, -dT dt, -rTolDt tol, -region tag, -legacy (Tecplot 8/9)
+          "@ | Set-Content "$pkg/README.txt" -Encoding ASCII
+
+      - name: Smoke test the packaged binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = (Get-ChildItem pkg -Directory | Where-Object Name -match '^OpenSees_.*_Windows_x64$').FullName
+          @'
+          puts "SMOKE_START"
+          wipe
+          model basic -ndm 2
+          node 1 0 0
+          node 2 1 0
+          fix 1 1 1
+          uniaxialMaterial Elastic 1 1000.0
+          element truss 1 1 2 1.0 1
+          timeSeries Linear 1
+          pattern Plain 1 Linear {
+              load 2 1.0 0.0
+          }
+          system BandGeneral
+          numberer Plain
+          constraints Plain
+          integrator LoadControl 1.0
+          algorithm Linear
+          analysis Static
+          recorder tecplot smoke.plt disp
+          analyze 1
+          puts "SMOKE_OK"
+          '@ | Set-Content smoke.tcl -Encoding ASCII
+
+          # Restrict PATH to Windows itself + the package: catches any DLL
+          # we failed to bundle, exactly like an end-user machine.
+          $env:TCL_LIBRARY = "$PWD/$pkg/lib/tcl8.6".Replace('/','\')
+          $oldPath = $env:PATH
+          $env:PATH = "$PWD/$pkg;C:\Windows\System32;C:\Windows".Replace('/','\')
+          try {
+            $out = & "$pkg/OpenSees.exe" smoke.tcl 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0 -or $out -notmatch 'SMOKE_OK') {
+              Write-Host $out; exit 1
+            }
+            if (-not (Test-Path smoke.plt) -or -not (Select-String -Path smoke.plt -Pattern 'Displacement' -Quiet)) {
+              Write-Host 'smoke.plt missing or empty'; exit 1
+            }
+            # and through the launcher users will actually click
+            $out2 = & cmd /c "`"$pkg\OpenSees.bat`" smoke.tcl" 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0 -or $out2 -notmatch 'SMOKE_OK') {
+              Write-Host $out2; exit 1
+            }
+          } finally {
+            $env:PATH = $oldPath
+          }
+          Write-Host "smoke test OK"
+
+      - name: Create zip
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem pkg -Directory | Where-Object Name -match '^OpenSees_.*_Windows_x64$'
+          Compress-Archive -Path $pkg.FullName -DestinationPath "pkg/$($pkg.Name).zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: pkg/*.zip
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-ubuntu, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release with all three binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > notes.md <<'EOF'
+          OpenSees with the new **Tecplot recorder**, built from a fork of OpenSees/OpenSees master (upstream ≥ v3.8.0).
+
+          ## What's different from upstream
+
+          1. **New `tecplot` recorder** — writes the whole model and its results to one ASCII Tecplot file, one FE zone per recorded step, with time strands so Tecplot 360 animates and probes time series out of the box (`-legacy` for Tecplot 8/9). Records `disp`, `vel`, `accel`, `incrDisp`, `reaction`, `pressure`, `unbalancedLoad`, `mass`, `eigen N` and element responses:
+
+             ```
+             recorder tecplot out.plt disp reaction
+             recorder tecplot out.plt eigen 1 eleResponse "axialForce"
+             ```
+
+             Options: `-precision n`, `-dT dt`, `-rTolDt tol`, `-region tag`, `-legacy`. OpenSeesPy: `ops.recorder('tecplot', 'out.plt', 'disp')`.
+
+          2. **Fixed heap buffer overflows in the VTK recorder** that wrote past the end of the name buffers and corrupted `.vtu` filenames (the run aborted in malloc; valgrind is clean now).
+
+          ## Downloads
+
+          | File | Runs on |
+          |---|---|
+          | `Windows_x64.zip` | Windows 10/11 (x64) |
+          | `macOS_arm64.tar.gz` | macOS 12+ on Apple Silicon |
+          | `Ubuntu22.04_x86_64.tar.gz` | Ubuntu 22.04+ and most glibc ≥ 2.35 Linux |
+
+          All required runtime libraries are inside the archives — **no development tools needed**.
+
+          - **Windows**: unzip anywhere, then run `OpenSees.bat your_script.tcl` (the DLLs and `lib\tcl8.6` must stay next to `OpenSees.exe`).
+          - **macOS / Linux**: extract, then run `./opensees your_script.tcl` from that directory (or `./OpenSees` directly).
+
+          Built with the same toolchains as upstream CI: MSVC 2022 + Intel oneAPI (MKL, MUMPS, ifx), GCC 11 + conan, AppleClang + GCC; Tcl 8.6.11, HDF5 1.14.6. Each packaged binary passed the OpenSees test suite and a from-scratch smoke analysis in a stripped environment.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OpenSees $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/ubuntu-package/* dist/macos-package/* dist/windows-package/*
