@@ -65,6 +65,7 @@ jobs:
 
           # Tcl script library (init.tcl and friends) from the conan package
           TCLDIR="$(dirname "$(find "$HOME/.conan2" -name init.tcl -path '*tcl8.6*' | head -n1)")"
+          if [ ! -f "$TCLDIR/init.tcl" ]; then echo "init.tcl not found in the conan cache" >&2; exit 1; fi
           cp -a "$TCLDIR" "$PKGDIR/lib/tcl8.6"
 
           # Bundle every non-system shared library the binary needs
@@ -108,10 +109,11 @@ jobs:
           cat > smoke.tcl <<'EOF'
           puts "SMOKE_START"
           wipe
-          model basic -ndm 2
+          model basic -ndm 2 -ndf 2
           node 1 0 0
           node 2 1 0
           fix 1 1 1
+          fix 2 0 1
           uniaxialMaterial Elastic 1 1000.0
           element truss 1 1 2 1.0 1
           timeSeries Linear 1
@@ -125,15 +127,24 @@ jobs:
           algorithm Linear
           analysis Static
           recorder tecplot smoke.plt disp
-          analyze 1
+          if {[analyze 1] != 0} { puts "ANALYSIS_FAILED"; exit 1 }
           puts "SMOKE_OK"
+          exit 0
           EOF
-          # the launcher must work in a bare environment (no build tools)
-          env -i PATH=/usr/bin:/bin HOME="$PWD" "./pkg/$PKG/opensees" smoke.tcl | tee smoke.log
+          # guard against any hang: hard timeout (GNU timeout, or perl alarm on macOS)
+          run_to() {
+            if command -v timeout >/dev/null 2>&1; then timeout -k 10 "$1" "${@:2}"
+            else perl -e 'alarm shift; exec @ARGV' "$1" "${@:2}"
+            fi
+          }
+          # the launcher must work in a bare environment (no build tools).
+          # stdin from /dev/null: g3TclMain reads stdin after the script,
+          # and an open pipe with no EOF there would block forever.
+          run_to 120 env -i PATH=/usr/bin:/bin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null | tee smoke.log
           grep -q SMOKE_OK smoke.log
           grep -q Displacement smoke.plt
           # the bare exe is informational only
-          env -i PATH=/usr/bin:/bin HOME="$PWD" "./pkg/$PKG/OpenSees" smoke.tcl \
+          run_to 120 env -i PATH=/usr/bin:/bin HOME="$PWD" ./pkg/$PKG/OpenSees smoke.tcl < /dev/null \
             || echo "::warning::bare ./OpenSees needs TCL_LIBRARY; start via ./opensees"
 
       - name: Create tarball
@@ -209,6 +220,7 @@ jobs:
           cp build/Release/OpenSees "$PKGDIR/"
 
           TCLDIR="$(dirname "$(find "$HOME/.conan2" -name init.tcl -path '*tcl8.6*' | head -n1)")"
+          if [ ! -f "$TCLDIR/init.tcl" ]; then echo "init.tcl not found in the conan cache" >&2; exit 1; fi
           cp -a "$TCLDIR" "$PKGDIR/lib/tcl8.6"
 
           # Recursively collect the non-system dylibs the binary links
@@ -288,10 +300,11 @@ jobs:
           cat > smoke.tcl <<'EOF'
           puts "SMOKE_START"
           wipe
-          model basic -ndm 2
+          model basic -ndm 2 -ndf 2
           node 1 0 0
           node 2 1 0
           fix 1 1 1
+          fix 2 0 1
           uniaxialMaterial Elastic 1 1000.0
           element truss 1 1 2 1.0 1
           timeSeries Linear 1
@@ -305,13 +318,22 @@ jobs:
           algorithm Linear
           analysis Static
           recorder tecplot smoke.plt disp
-          analyze 1
+          if {[analyze 1] != 0} { puts "ANALYSIS_FAILED"; exit 1 }
           puts "SMOKE_OK"
+          exit 0
           EOF
-          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" "./pkg/$PKG/opensees" smoke.tcl | tee smoke.log
+          # guard against any hang: hard timeout (GNU timeout, or perl alarm on macOS)
+          run_to() {
+            if command -v timeout >/dev/null 2>&1; then timeout -k 10 "$1" "${@:2}"
+            else perl -e 'alarm shift; exec @ARGV' "$1" "${@:2}"
+            fi
+          }
+          # stdin from /dev/null: g3TclMain reads stdin after the script,
+          # and an open pipe with no EOF there would block forever.
+          run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/opensees smoke.tcl < /dev/null | tee smoke.log
           grep -q SMOKE_OK smoke.log
           grep -q Displacement smoke.plt
-          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" "./pkg/$PKG/OpenSees" smoke.tcl \
+          run_to 120 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$PWD" ./pkg/$PKG/OpenSees smoke.tcl < /dev/null \
             || echo "::warning::bare ./OpenSees needs TCL_LIBRARY; start via ./opensees"
 
       - name: Create tarball
@@ -416,8 +438,11 @@ jobs:
             Where-Object { $_.FullName -match 'tcl8\.6' } | Select-Object -First 1
           if ($tclInit) {
             Copy-Item -Recurse $tclInit.Directory.FullName "$pkg/lib/tcl8.6"
+            if (-not (Test-Path "$pkg/lib/tcl8.6/init.tcl")) {
+              Write-Error "tcl8.6 library did not land in the package"; exit 1
+            }
           } else {
-            Write-Warning "init.tcl not found in the conan cache"
+            Write-Error "init.tcl not found in the conan cache"; exit 1
           }
 
           # Index every DLL available from the build tree, the conan cache and
@@ -486,10 +511,11 @@ jobs:
           @'
           puts "SMOKE_START"
           wipe
-          model basic -ndm 2
+          model basic -ndm 2 -ndf 2
           node 1 0 0
           node 2 1 0
           fix 1 1 1
+          fix 2 0 1
           uniaxialMaterial Elastic 1 1000.0
           element truss 1 1 2 1.0 1
           timeSeries Linear 1
@@ -503,15 +529,16 @@ jobs:
           algorithm Linear
           analysis Static
           recorder tecplot smoke.plt disp
-          analyze 1
+          if {[analyze 1] != 0} { puts "ANALYSIS_FAILED"; exit 1 }
           puts "SMOKE_OK"
+          exit 0
           '@ | Set-Content smoke.tcl -Encoding ASCII
 
           # Restrict PATH to Windows itself + the package: catches any DLL
           # we failed to bundle, exactly like an end-user machine.
-          $env:TCL_LIBRARY = "$PWD/$pkg/lib/tcl8.6".Replace('/','\')
+          $env:TCL_LIBRARY = Join-Path $pkg 'lib\tcl8.6'
           $oldPath = $env:PATH
-          $env:PATH = "$PWD/$pkg;C:\Windows\System32;C:\Windows".Replace('/','\')
+          $env:PATH = "$pkg;C:\Windows\System32;C:\Windows"
           try {
             $out = & "$pkg/OpenSees.exe" smoke.tcl 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0 -or $out -notmatch 'SMOKE_OK') {
